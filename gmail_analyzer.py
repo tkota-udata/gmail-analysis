@@ -834,7 +834,7 @@ class GmailAnalyzer:
         """具体的な改善提案を生成（JST対応）"""
         try:
             # 日本時間に変換（+9時間）
-            df['date_jst'] = pd.to_datetime(df['date']) + pd.Timedelta(hours=9)
+            df['date_jst'] = pd.to_datetime(df['date'])
             
             # 時間帯分析
             df['hour_jst'] = df['date_jst'].dt.hour
@@ -901,7 +901,7 @@ class GmailAnalyzer:
         """月別推移グラフを作成（JST対応、タイムゾーン警告修正版）"""
         try:
             # 日本時間に変換（+9時間）
-            df['date_jst'] = pd.to_datetime(df['date']) + pd.Timedelta(hours=9)
+            df['date_jst'] = pd.to_datetime(df['date'])
             
             # 月次集計（タイムゾーン情報を落とさないように修正）
             df['year_month'] = df['date_jst'].dt.strftime('%Y-%m')
@@ -1168,7 +1168,7 @@ class GmailAnalyzer:
         try:
             # 日本時間に変換（+9時間）
             df = df.copy()  # 元のデータフレームを変更しないようにコピー
-            df['date_jst'] = pd.to_datetime(df['date']) + pd.Timedelta(hours=9)
+            df['date_jst'] = pd.to_datetime(df['date'])
             
             # 数値で曜日を取得（0=月曜日, 1=火曜日, ..., 6=日曜日）して正確な順序を確保
             df['weekday_num'] = df['date_jst'].dt.weekday
@@ -1540,7 +1540,7 @@ class GmailAnalyzer:
             read_ratio = read_count / total_count * 100
             
             # 時間帯別の既読率
-            df['date_jst'] = pd.to_datetime(df['date']) + pd.Timedelta(hours=9)
+            df['date_jst'] = pd.to_datetime(df['date'])
             df['hour_jst'] = df['date_jst'].dt.hour
             
             hourly_read = df.groupby('hour_jst')['read'].agg(['sum', 'count'])
@@ -1604,7 +1604,7 @@ class GmailAnalyzer:
             insights.append(f"・全体の既読率は{read_ratio:.1f}%です。業界平均は約22%であり、これを基準に評価できます。")
             
             # 時間帯別の既読率
-            df['date_jst'] = pd.to_datetime(df['date']) + pd.Timedelta(hours=9)
+            df['date_jst'] = pd.to_datetime(df['date'])
             df['hour_jst'] = df['date_jst'].dt.hour
             
             hourly_read = df.groupby('hour_jst')['read'].agg(['sum', 'count'])
