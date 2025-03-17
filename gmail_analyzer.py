@@ -16,6 +16,9 @@ from collections import Counter
 import base64
 import re
 from matplotlib.colors import LinearSegmentedColormap
+import json
+import google.auth.exceptions
+import anthropic  # Anthropic APIクライアント
 
 # matplotlib設定を強化（日本語フォント対応）
 plt.rcParams['font.family'] = 'sans-serif'
@@ -98,32 +101,79 @@ class GmailAnalyzer:
         # 一時的なプロットディレクトリの作成
         Path('temp_plots').mkdir(exist_ok=True)
     
-    def authenticate(self):
-        creds = None
-        if os.path.exists('token.json'):
-            with open('token.json', 'r') as token:
-                creds_json = token.read()
-                self.creds = Credentials.from_authorized_user_info(eval(creds_json), SCOPES)
+    def authenticate(self, credentials_path='credentials.json'):
+        """認証を行うためのパブリックメソッド（デフォルトパス対応）"""
+        # 認証情報パスを保存
+        self.credentials_path = credentials_path
         
-        if not self.creds or not self.creds.valid:
-            if self.creds and self.creds.expired and self.creds.refresh_token:
-                self.creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    'credentials.json', SCOPES)
-                self.creds = flow.run_local_server(port=0)
-                with open('token.json', 'w') as token:
-                    token.write(self.creds.to_json())
+        # 内部認証メソッドを呼び出し
+        self.service = self._authenticate()
+        
+        if self.service:
+            print("認証に成功しました。Gmail APIに接続しています。")
+            return True
+        else:
+            print("認証に失敗しました。認証情報を確認してください。")
+            return False
+
+    def _authenticate(self):
+        """GoogleのOAuth認証を行い、GmailAPIのサービスオブジェクトを返す（エラー処理強化版）"""
+        try:
+            creds = None
+            # トークンファイルが存在する場合は読み込む
+            if os.path.exists('token.json'):
+                try:
+                    creds = Credentials.from_authorized_user_info(
+                        json.load(open('token.json', 'r')), 
+                        SCOPES
+                    )
+                except Exception as e:
+                    print(f"トークンファイル読み込みエラー: {e}")
+                    # トークンファイルに問題がある場合は削除
+                    os.remove('token.json')
+                    creds = None
+            
+            # 有効な認証情報がない場合はユーザーにログインを促す
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    try:
+                        creds.refresh(Request())
+                    except google.auth.exceptions.RefreshError as e:
+                        print(f"トークンリフレッシュエラー: {e}")
+                        # トークンの更新に失敗した場合はファイルを削除して再認証
+                        if os.path.exists('token.json'):
+                            os.remove('token.json')
+                        # 新しい認証フローを開始
+                        flow = InstalledAppFlow.from_client_secrets_file(
+                            self.credentials_path, SCOPES)
+                        creds = flow.run_local_server(port=0)
+                else:
+                    # 通常の認証フロー
+                    flow = InstalledAppFlow.from_client_secrets_file(
+                        self.credentials_path, SCOPES)
+                    creds = flow.run_local_server(port=0)
                 
-        self.service = build('gmail', 'v1', credentials=self.creds)
-    
+                # 認証情報を保存
+                with open('token.json', 'w') as token:
+                    token.write(creds.to_json())
+            
+            # Gmail APIのサービスを構築
+            service = build('gmail', 'v1', credentials=creds)
+            return service
+        
+        except Exception as e:
+            print(f"認証エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     def analyze_emails_from_sender(self, sender_email):
         """指定した送信者からのメールを分析する（直近100件）"""
         # 検索クエリを設定
         query = f'from:{sender_email}'
         
         # メールの検索（100件に制限）
-        max_emails = 100
+        max_emails = 500
         results = self.service.users().messages().list(userId='me', q=query, maxResults=max_emails).execute()
         messages = []
         
@@ -421,363 +471,399 @@ class GmailAnalyzer:
         
         return insights
 
-    def generate_comprehensive_pdf_report(self, df, sender_email):
-        """マーケティング分析を含む1枚のPDFレポートを生成（ヒートマップ表示修正版）"""
+    def generate_comprehensive_pdf_report(self, df, sender_email, output_path=None):
+        """総合的なPDFレポートを生成（1ページレイアウト版）"""
         try:
-            # 一時ディレクトリの作成
-            Path('temp_plots').mkdir(exist_ok=True)
+            # メールアドレスを含むファイル名の生成
+            if output_path is None:
+                # メールアドレスから不正なファイル名文字を削除
+                safe_email = re.sub(r'[\\/*?:"<>|]', "_", sender_email)
+                # 現在の日時を追加
+                current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_path = f'gmail_analysis_{safe_email}_{current_time}.pdf'
             
-            # 引数なしでPDF初期化（カスタムPDFクラス対応）
-            pdf = PDF()
+            print(f"レポートファイル名: {output_path}")
             
-            # マージン設定
-            margin = 10
-            pdf.set_margins(margin, margin, margin)
+            # 一時プロットディレクトリの作成
+            os.makedirs('temp_plots', exist_ok=True)
             
-            # ページサイズとレイアウト計算（A4サイズを想定）
-            page_width = 190  # A4の幅からマージンを引いた値
-            graph_width = (page_width - margin) / 2
-            graph_height = graph_width * 0.6
+            # 各種グラフの生成（サイズをさらに小さく調整）
+            hourly_plot = self._create_hourly_distribution_plot(df, figsize=(5, 3))
+            weekday_plot = self._create_weekday_distribution_plot(df, figsize=(5, 3))
+            monthly_plot = self._create_monthly_distribution_plot(df, figsize=(5, 3))
+            heatmap_plot = self._create_heatmap(df, figsize=(5, 3))
             
-            # 列の開始位置
-            col1_x = margin
-            col2_x = margin + graph_width + margin/2
+            # Claudeを使用して考察を生成
+            try:
+                print("Claude APIを使用して考察を生成中...")
+                claude_insights = self.generate_insights_with_claude(df, sender_email)
+                print(f"生成された考察の数: {len(claude_insights)}")
+                
+                # デバッグ: 考察の内容を表示
+                for i, insight in enumerate(claude_insights):
+                    print(f"考察 {i+1}: {insight[:50]}...")
+                
+            except Exception as e:
+                print(f"Claude考察生成エラー: {e}")
+                # エラー時はデフォルトの考察を使用
+                claude_insights = self._get_default_insights()
+                print("デフォルトの考察を使用します")
             
-            # ===== レポート作成 =====
+            # 考察がない場合はデフォルトを使用
+            if not claude_insights:
+                print("考察が空のため、デフォルトの考察を使用します")
+                claude_insights = self._get_default_insights()
+            
+            # FPDFのインポート（XPos, YPosも含む）
+            from fpdf import FPDF
+            try:
+                # FPDF v2.5.2以降の場合、XPosとYPosをインポート
+                from fpdf.enums import XPos, YPos
+                has_new_api = True
+            except ImportError:
+                # 古いバージョンの場合
+                has_new_api = False
+                print("警告: FPDFの古いバージョンを使用しています。非推奨警告が表示される場合があります。")
+            
+            # PDFの作成
+            pdf = FPDF(orientation='P', unit='mm', format='A4')
+            
+            # 日本語フォントの設定
+            japanese_font_available = False
+            try:
+                # フォントファイルの存在確認
+                font_paths = [
+                    'fonts/ipaexg.ttf',  # 指定パス
+                    '/usr/share/fonts/truetype/ipafont/ipag.ttf',  # Linux
+                    '/Library/Fonts/Arial Unicode.ttf',  # macOS
+                    'C:\\Windows\\Fonts\\msgothic.ttc'  # Windows
+                ]
+                
+                font_file = None
+                for path in font_paths:
+                    if os.path.exists(path):
+                        font_file = path
+                        break
+                
+                if font_file:
+                    # 通常とボールドのみ追加（イタリックは使用しない）
+                    pdf.add_font('unicode', '', font_file)
+                    pdf.add_font('unicode', 'B', font_file)
+                    japanese_font_available = True
+                    print(f"日本語フォントを使用: {font_file}")
+                else:
+                    print("警告: 日本語フォントが見つかりません。英語でレポートを生成します。")
+            except Exception as e:
+                print(f"フォント設定エラー: {e}")
+                japanese_font_available = False
+            
+            # ページ設定
+            pdf.set_auto_page_break(auto=True, margin=5)  # マージンを小さく
             pdf.add_page()
             
-            # 1. ヘッダーセクション
-            if pdf.japanese_font_available:
-                pdf.set_font('japanese', 'B', 14)
-            else:
-                pdf.set_font('helvetica', 'B', 14)
+            # ヘッダー部分（背景色付き）
+            pdf.set_fill_color(52, 152, 219)  # 青色の背景
+            pdf.rect(0, 0, 210, 12, 'F')  # ヘッダーの高さを小さく
             
-            pdf.set_fill_color(41, 128, 185)  # 青色の背景
-            pdf.set_text_color(255, 255, 255)  # 白色のテキスト
-            pdf.cell(page_width, 10, 'Gmailマーケティング分析レポート', 
-                    0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+            # タイトル（白色）
+            pdf.set_text_color(255, 255, 255)
+            if japanese_font_available:
+                pdf.set_font('unicode', 'B', 12)  # フォントサイズを小さく
+                title = f'Gmail送信分析レポート: {sender_email}'
+            else:
+                pdf.set_font('helvetica', 'B', 12)  # フォントサイズを小さく
+                title = f'Gmail Analysis Report: {sender_email}'
+            
+            # 非推奨警告を回避するためのcell呼び出し
+            if has_new_api:
+                pdf.cell(0, 8, title, 0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+            else:
+                pdf.cell(0, 8, title, 0, 1, 'C')
+            
+            # 本文の色を戻す
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(2)  # 間隔を小さく
             
             # 基本情報
-            pdf.set_fill_color(245, 245, 245)  # 薄いグレーの背景
-            pdf.set_text_color(0, 0, 0)  # 黒色のテキスト
-            
-            if pdf.japanese_font_available:
-                pdf.set_font('japanese', '', 8)
+            if japanese_font_available:
+                pdf.set_font('unicode', 'B', 8)  # フォントサイズを小さく
+                basic_info = f'分析期間: {df["date"].min().strftime("%Y-%m-%d")} 〜 {df["date"].max().strftime("%Y-%m-%d")} | 総メール数: {len(df)}件'
             else:
-                pdf.set_font('helvetica', '', 8)
-                
-            pdf.cell(page_width, 6, 
-                    f'送信者: {sender_email} | メール数: {len(df)}件 | 期間: {df["date"].min().strftime("%Y/%m/%d")} - {df["date"].max().strftime("%Y/%m/%d")}', 
-                    0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
-            pdf.ln(4)
+                pdf.set_font('helvetica', 'B', 8)  # フォントサイズを小さく
+                basic_info = f'Analysis Period: {df["date"].min().strftime("%Y-%m-%d")} to {df["date"].max().strftime("%Y-%m-%d")} | Total Emails: {len(df)}'
             
-            # 2. グラフセクション - 1行目
-            row1_y = pdf.get_y()
+            # 非推奨警告を回避するためのcell呼び出し
+            if has_new_api:
+                pdf.cell(0, 4, basic_info, 0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
+            else:
+                pdf.cell(0, 4, basic_info, 0, 1, 'C')
             
+            pdf.ln(2)  # 間隔を小さく
+            
+            # グラフの配置（2x2グリッド）- サイズを小さく
+            graph_width = 80
+            graph_height = 50
+            
+            # 1行目: 時間帯と曜日
             # 時間帯分布グラフ
-            hourly_path = self._create_hourly_distribution_plot(df, figsize=(5, 3))
-            if hourly_path:
-                # グラフタイトルの背景色設定
-                pdf.set_fill_color(52, 152, 219)  # 青色
-                pdf.set_text_color(255, 255, 255)  # 白色テキスト
-                
-                if pdf.japanese_font_available:
-                    pdf.set_font('japanese', 'B', 9)
+            if hourly_plot:
+                pdf.set_xy(10, 25)
+                if japanese_font_available:
+                    pdf.set_font('unicode', 'B', 7)  # フォントサイズを小さく
+                    hourly_title = '1. 時間帯別分布'
                 else:
-                    pdf.set_font('helvetica', 'B', 9)
+                    pdf.set_font('helvetica', 'B', 7)  # フォントサイズを小さく
+                    hourly_title = '1. Hourly Distribution'
                 
-                pdf.set_xy(col1_x, row1_y)
-                pdf.cell(graph_width, 6, '1. 時間帯別分布（JST）', 0, 
-                        new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+                pdf.set_fill_color(41, 128, 185)  # 青色の背景
                 
-                pdf.image(hourly_path, x=col1_x, y=row1_y + 6, w=graph_width)
-            
-            # 曜日分布グラフ
-            weekday_path = self._create_weekday_distribution_plot(df, figsize=(5, 3))
-            if weekday_path:
-                # グラフタイトルの背景色設定
-                pdf.set_fill_color(46, 204, 113)  # 緑色
-                pdf.set_text_color(255, 255, 255)  # 白色テキスト
-                
-                if pdf.japanese_font_available:
-                    pdf.set_font('japanese', 'B', 9)
+                # 非推奨警告を回避するためのcell呼び出し
+                if has_new_api:
+                    pdf.cell(graph_width, 4, hourly_title, 0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
                 else:
-                    pdf.set_font('helvetica', 'B', 9)
+                    pdf.cell(graph_width, 4, hourly_title, 0, 1, 'C', 1)
                 
-                pdf.set_xy(col2_x, row1_y)
-                pdf.cell(graph_width, 6, '2. 曜日別分布（JST）', 0, 
-                        new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
-                
-                pdf.image(weekday_path, x=col2_x, y=row1_y + 6, w=graph_width)
+                pdf.image(hourly_plot, x=10, y=30, w=graph_width, h=graph_height)
             
-            # 3. グラフセクション - 2行目
-            row2_y = row1_y + graph_height + 12
-            
-            # 月別推移グラフ
-            time_series_path = self._create_time_series_plot(df, figsize=(5, 3))
-            if time_series_path:
-                # グラフタイトルの背景色設定
-                pdf.set_fill_color(155, 89, 182)  # 紫色
-                pdf.set_text_color(255, 255, 255)  # 白色テキスト
-                
-                if pdf.japanese_font_available:
-                    pdf.set_font('japanese', 'B', 9)
+            # 曜日別分布グラフ
+            if weekday_plot:
+                pdf.set_xy(110, 25)
+                if japanese_font_available:
+                    pdf.set_font('unicode', 'B', 7)  # フォントサイズを小さく
+                    weekday_title = '2. 曜日別分布'
                 else:
-                    pdf.set_font('helvetica', 'B', 9)
+                    pdf.set_font('helvetica', 'B', 7)  # フォントサイズを小さく
+                    weekday_title = '2. Weekday Distribution'
                 
-                pdf.set_xy(col1_x, row2_y)
-                pdf.cell(graph_width, 6, '3. 月別推移', 0, 
-                        new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+                pdf.set_fill_color(46, 204, 113)  # 緑色の背景
                 
-                pdf.image(time_series_path, x=col1_x, y=row2_y + 6, w=graph_width)
-            
-            # ヒートマップの追加（改善版）
-            print("ヒートマップ作成を開始します...")
-            heatmap_path = self._create_heatmap(df, figsize=(5, 3))
-            if heatmap_path:
-                print(f"ヒートマップパス: {heatmap_path}")
-                # グラフタイトルの背景色設定
-                pdf.set_fill_color(230, 126, 34)  # オレンジ色
-                pdf.set_text_color(255, 255, 255)  # 白色テキスト
-                
-                if pdf.japanese_font_available:
-                    pdf.set_font('japanese', 'B', 9)
+                # 非推奨警告を回避するためのcell呼び出し
+                if has_new_api:
+                    pdf.cell(graph_width, 4, weekday_title, 0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
                 else:
-                    pdf.set_font('helvetica', 'B', 9)
+                    pdf.cell(graph_width, 4, weekday_title, 0, 1, 'C', 1)
                 
-                pdf.set_xy(col2_x, row2_y)
-                pdf.cell(graph_width, 6, '4. 時間帯×曜日ヒートマップ', 0, 
-                        new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+                pdf.image(weekday_plot, x=110, y=30, w=graph_width, h=graph_height)
+            
+            # 2行目: 月別とヒートマップ
+            # 月別分布グラフ
+            if monthly_plot:
+                pdf.set_xy(10, 85)
+                if japanese_font_available:
+                    pdf.set_font('unicode', 'B', 7)  # フォントサイズを小さく
+                    monthly_title = '3. 月別分布'
+                else:
+                    pdf.set_font('helvetica', 'B', 7)  # フォントサイズを小さく
+                    monthly_title = '3. Monthly Distribution'
                 
-                # 画像サイズを明示的に指定
-                pdf.image(heatmap_path, x=col2_x, y=row2_y + 6, w=graph_width, h=graph_height)
-            else:
-                print("ヒートマップの作成に失敗しました")
-                # ヒートマップが作成できない場合のフォールバック
-                pdf.set_xy(col2_x, row2_y)
-                pdf.cell(graph_width, 6, '4. 時間帯×曜日ヒートマップ', 0, 
-                        new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+                pdf.set_fill_color(155, 89, 182)  # 紫色の背景
                 
-                pdf.set_text_color(0, 0, 0)  # 黒色テキスト
-                if pdf.japanese_font_available:
-                    pdf.set_font('japanese', '', 8)
+                # 非推奨警告を回避するためのcell呼び出し
+                if has_new_api:
+                    pdf.cell(graph_width, 4, monthly_title, 0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
                 else:
-                    pdf.set_font('helvetica', '', 8)
+                    pdf.cell(graph_width, 4, monthly_title, 0, 1, 'C', 1)
                 
-                pdf.set_xy(col2_x, row2_y + 10)
-                pdf.multi_cell(graph_width, 4, "※ ヒートマップの作成に必要なデータが不足しています。")
+                pdf.image(monthly_plot, x=10, y=90, w=graph_width, h=graph_height)
             
-            # 4. マーケティング考察セクション
-            row3_y = row2_y + graph_height + 12
-            
-            # マーケティング考察タイトル
-            pdf.set_fill_color(231, 76, 60)  # 赤色
-            pdf.set_text_color(255, 255, 255)  # 白色テキスト
-            
-            if pdf.japanese_font_available:
-                pdf.set_font('japanese', 'B', 10)
-            else:
-                pdf.set_font('helvetica', 'B', 10)
-            
-            pdf.set_xy(margin, row3_y)
-            pdf.cell(page_width, 7, 'マーケティングプロの考察', 
-                    0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
-            
-            # マーケティング考察内容
-            pdf.set_text_color(0, 0, 0)  # 黒色テキスト
-            
-            # 考察を2列に分割
-            marketing_insights = self._generate_marketing_insights(df, sender_email)
-            
-            # 左列：エンゲージメント分析と行動パターン分析
-            engagement_insights = marketing_insights[:5]  # エンゲージメント分析
-            behavior_insights = marketing_insights[5:8]   # 行動パターン分析
-            
-            # 右列：マーケティング効果と改善提案
-            effect_insights = marketing_insights[8:8]      # マーケティング効果
-            recommendations = self._generate_recommendations(df)
-            
-            # 左列の表示
-            pdf.set_xy(col1_x, row3_y + 8)
-            
-            for i, insight in enumerate(engagement_insights):
-                if i == 0:  # タイトル行
-                    pdf.set_fill_color(241, 196, 15)  # 黄色の背景
-                    if pdf.japanese_font_available:
-                        pdf.set_font('japanese', 'B', 9)
-                    else:
-                        pdf.set_font('helvetica', 'B', 9)
-                    pdf.cell(graph_width, 6, insight, 0, 
-                            new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='L', fill=True)
+            # ヒートマップ
+            if heatmap_plot:
+                pdf.set_xy(110, 85)
+                if japanese_font_available:
+                    pdf.set_font('unicode', 'B', 7)  # フォントサイズを小さく
+                    heatmap_title = '4. 時間帯×曜日ヒートマップ'
                 else:
-                    if pdf.japanese_font_available:
-                        pdf.set_font('japanese', '', 8)
-                    else:
-                        pdf.set_font('helvetica', '', 8)
-                    pdf.set_x(col1_x)
-                    pdf.multi_cell(graph_width, 4, insight)
-            
-            pdf.ln(2)
-            pdf.set_x(col1_x)
-            
-            for i, insight in enumerate(behavior_insights):
-                if i == 0:  # タイトル行
-                    pdf.set_fill_color(241, 196, 15)  # 黄色の背景
-                    if pdf.japanese_font_available:
-                        pdf.set_font('japanese', 'B', 9)
-                    else:
-                        pdf.set_font('helvetica', 'B', 9)
-                    pdf.cell(graph_width, 6, insight, 0, 
-                            new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='L', fill=True)
+                    pdf.set_font('helvetica', 'B', 7)  # フォントサイズを小さく
+                    heatmap_title = '4. Hour x Weekday Heatmap'
+                
+                pdf.set_fill_color(211, 84, 0)  # オレンジ色の背景
+                
+                # 非推奨警告を回避するためのcell呼び出し
+                if has_new_api:
+                    pdf.cell(graph_width, 4, heatmap_title, 0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
                 else:
-                    if pdf.japanese_font_available:
-                        pdf.set_font('japanese', '', 8)
-                    else:
-                        pdf.set_font('helvetica', '', 8)
-                    pdf.set_x(col1_x)
-                    pdf.multi_cell(graph_width, 4, insight)
+                    pdf.cell(graph_width, 4, heatmap_title, 0, 1, 'C', 1)
+                
+                pdf.image(heatmap_plot, x=110, y=90, w=graph_width, h=graph_height)
             
-            # 右列の表示
-            current_y = row3_y + 8
-            pdf.set_xy(col2_x, current_y)
-            
-            for i, insight in enumerate(effect_insights):
-                if i == 0:  # タイトル行
-                    pdf.set_fill_color(241, 196, 15)  # 黄色の背景
-                    if pdf.japanese_font_available:
-                        pdf.set_font('japanese', 'B', 9)
-                    else:
-                        pdf.set_font('helvetica', 'B', 9)
-                    pdf.cell(graph_width, 6, insight, 0, 
-                            new_x=XPos.RIGHT, new_y=YPos.NEXT, align='L', fill=True)
-                else:
-                    if pdf.japanese_font_available:
-                        pdf.set_font('japanese', '', 8)
-                    else:
-                        pdf.set_font('helvetica', '', 8)
-                    pdf.set_x(col2_x)
-                    pdf.multi_cell(graph_width, 4, insight)
-            
-            # 改善提案
-            pdf.ln(2)
-            pdf.set_x(col2_x)
-            
-            pdf.set_fill_color(241, 196, 15)  # 黄色の背景
-            if pdf.japanese_font_available:
-                pdf.set_font('japanese', 'B', 9)
+            # 考察セクション（1ページ目の下部に配置）
+            pdf.set_xy(10, 145)
+            if japanese_font_available:
+                pdf.set_font('unicode', 'B', 9)
+                insights_title = 'データに基づく考察と改善提案'
             else:
                 pdf.set_font('helvetica', 'B', 9)
-            pdf.cell(graph_width, 6, '【具体的な改善提案】', 0, 
-                    new_x=XPos.LEFT, new_y=YPos.NEXT, align='L', fill=True)
+                insights_title = 'Data-based Insights and Recommendations'
             
-            if pdf.japanese_font_available:
-                pdf.set_font('japanese', '', 8)
+            pdf.set_fill_color(241, 196, 15)  # 黄色の背景
+            
+            # 非推奨警告を回避するためのcell呼び出し
+            if has_new_api:
+                pdf.cell(0, 5, insights_title, 0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C', fill=True)
+            else:
+                pdf.cell(0, 5, insights_title, 0, 1, 'C', 1)
+            
+            # 考察の表示（1ページに収めるためにコンパクトに）
+            if japanese_font_available:
+                pdf.set_font('unicode', '', 8)
             else:
                 pdf.set_font('helvetica', '', 8)
             
-            # 各改善提案を左揃えで表示
-            for rec in recommendations:
-                pdf.set_x(col2_x)
-                pdf.multi_cell(graph_width, 4, rec, align='L')  # 左揃えを明示的に指定
+            # 考察を表示（2列レイアウト）
+            y_pos = 155
+            col_width = 95  # 列の幅
+            line_height = 8  # 行の高さ
             
-            # ヘッダーセクション
-            if pdf.japanese_font_available:
-                pdf.set_font('japanese', 'B', 14)
+            for i, insight in enumerate(claude_insights):
+                if insight.strip():  # 空行をスキップ
+                    # 箇条書きの番号がない場合は追加
+                    if not re.match(r'^\d+\.', insight.strip()):
+                        insight = f"{i+1}. {insight}"
+                    
+                    # 左右の列に分けて表示
+                    x_pos = 10 if i % 2 == 0 else 105
+                    
+                    # 偶数番目の考察で新しい行を開始
+                    if i % 2 == 0 and i > 0:
+                        y_pos += line_height
+                    
+                    # 考察テキスト
+                    pdf.set_xy(x_pos, y_pos)
+                    pdf.multi_cell(col_width, 4, insight, align='L')
+                    
+                    # 奇数番目の考察の後に行を進める
+                    if i % 2 == 1:
+                        y_pos += line_height
+            
+            # フッター
+            pdf.set_y(-10)
+            if japanese_font_available:
+                pdf.set_font('unicode', '', 6)  # フォントサイズをさらに小さく
+                footer = f'作成日時: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} - Gmail分析ツール'
             else:
-                pdf.set_font('helvetica', 'B', 14)
+                pdf.set_font('helvetica', '', 6)  # フォントサイズをさらに小さく
+                footer = f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} - Gmail Analysis Tool'
             
-            pdf.set_fill_color(41, 128, 185)  # 青色の背景
-            pdf.set_text_color(255, 255, 255)  # 白色のテキスト
+            # 非推奨警告を回避するためのcell呼び出し
+            if has_new_api:
+                pdf.cell(0, 6, footer, 0, new_x=XPos.RIGHT, new_y=YPos.TOP, align='C')
+            else:
+                pdf.cell(0, 6, footer, 0, 0, 'C')
             
-            # PDFを保存
-            output_path = 'gmail_marketing_report.pdf'
+            # PDFの保存
             pdf.output(output_path)
+            print(f"PDFレポートを作成しました: {output_path}")
             
             # 一時ファイルの削除
-            for file in Path('temp_plots').glob('*.png'):
-                try:
-                    file.unlink()
-                except:
-                    pass
+            for plot in [hourly_plot, weekday_plot, monthly_plot, heatmap_plot]:
+                if plot and os.path.exists(plot):
+                    os.remove(plot)
             
             return output_path
             
         except Exception as e:
-            print(f"PDFレポート生成エラー: {e}")
+            print(f"PDFレポート作成エラー: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _create_hourly_distribution_plot(self, df, figsize=(10, 6)):
-        """時間帯別分布グラフを作成（JST対応）"""
+        """時間帯分布のグラフを作成"""
+        import matplotlib.pyplot as plt
+        
         try:
-            # 時間帯データの準備（UTCから+9時間してJSTに変換）
-            df['hour_jst'] = (pd.to_datetime(df['date']).dt.hour) % 24
-            hourly_counts = df['hour_jst'].value_counts().sort_index()
+            # 日本時間に変換（すでに変換済みなので+9時間は不要）
+            df['date_jst'] = pd.to_datetime(df['date'])
             
-            # プロット
+            # 時間帯分析
+            hourly_counts = df['date_jst'].dt.hour.value_counts().sort_index()
+            
+            # 24時間分のデータをカウント0で初期化
+            all_hours = pd.Series(0, index=range(24))
+            # 実際のデータで上書き
+            all_hours.update(hourly_counts)
+            
+            # グラフ作成
             plt.figure(figsize=figsize)
-            ax = sns.barplot(x=hourly_counts.index, y=hourly_counts.values, color='#3498db')
+            ax = all_hours.plot(kind='bar', color='skyblue')
             
-            # ピーク時間の強調
-            peak_hour = hourly_counts.idxmax()
-            for i, bar in enumerate(ax.patches):
-                if hourly_counts.index[i] == peak_hour:
-                    bar.set_color('#e74c3c')
+            plt.title('時間帯別メール分布', fontsize=14)
+            plt.xlabel('時間帯', fontsize=12)
+            plt.ylabel('メール数', fontsize=12)
+            plt.xticks(rotation=45)
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
             
-            plt.title('時間帯別メール数（日本時間）', pad=10)
-            plt.xlabel('時間（JST）')
-            plt.ylabel('メール数')
-            plt.xticks(range(len(hourly_counts)), hourly_counts.index)
+            # データラベル追加
+            for i, v in enumerate(all_hours):
+                ax.text(i, v + 0.1, str(v), ha='center')
+            
             plt.tight_layout()
-            
-            # 一時ファイルとして保存
-            output_path = 'temp_plots/hourly_distribution.png'
-            plt.savefig(output_path)
+            plt.savefig('temp_plots/hourly_distribution.png')
             plt.close()
-            
-            return output_path
             
         except Exception as e:
             print(f"時間帯グラフ作成エラー: {e}")
-            return None
+            # エラー時は空のグラフを作成
+            plt.figure(figsize=figsize)
+            plt.title('時間帯別分布 (利用不可)', fontsize=14)
+            plt.savefig('temp_plots/hourly_distribution.png')
+            plt.close()
+        
+        return 'temp_plots/hourly_distribution.png'
 
     def _create_weekday_distribution_plot(self, df, figsize=(10, 6)):
-        """曜日別分布グラフを作成（JST対応）"""
+        """曜日分布のグラフを作成（土日を青色で強調）"""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        plt.figure(figsize=figsize)
+        
         try:
-            # 日本時間に変換（+9時間）
-            df['date_jst'] = pd.to_datetime(df['date'])
-            df['weekday_jst'] = df['date_jst'].dt.day_name()
+            # 曜日データの取得（安全に）
+            if 'weekday' in df.columns:
+                # すでに曜日列がある場合はそれを使用
+                weekday_counts = df['weekday'].value_counts()
+            else:
+                # date列から曜日を計算（型チェック付き）
+                if not pd.api.types.is_datetime64_any_dtype(df['date']):
+                    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+                
+                # 有効な日付のみで計算
+                valid_dates = df[df['date'].notna()]
+                if len(valid_dates) > 0:
+                    weekday_counts = valid_dates['date'].dt.day_name().value_counts()
+                else:
+                    weekday_counts = pd.Series(dtype='int64')
             
-            weekday_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-            weekday_counts = df['weekday_jst'].value_counts().reindex(weekday_order)
+            # 曜日の順序を設定
+            ordered_days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            ordered_counts = pd.Series([weekday_counts.get(day, 0) for day in ordered_days], index=ordered_days)
             
-            # 日本語曜日ラベル
-            jp_weekdays = ['月曜日', '火曜日', '水曜日', '木曜日', '金曜日', '土曜日', '日曜日']
+            # 土日とそれ以外で色を分ける
+            colors = ['#FF9999', '#FF9999', '#FF9999', '#FF9999', '#FF9999', '#6699CC', '#4477AA']
             
-            # プロット
-            plt.figure(figsize=figsize)
-            ax = sns.barplot(x=weekday_counts.index, y=weekday_counts.values, color='#2ecc71')
+            # グラフ作成
+            ax = ordered_counts.plot(kind='bar', color=colors)
             
-            # 週末の強調
-            for i, bar in enumerate(ax.patches):
-                if i >= 5:  # 土日
-                    bar.set_color('#e74c3c')
+            plt.title('曜日別メール分布', fontsize=14)
+            plt.xlabel('曜日', fontsize=12)
+            plt.ylabel('メール数', fontsize=12)
+            plt.xticks(rotation=45)
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
             
-            plt.title('曜日別メール数（日本時間）', pad=10)
-            plt.xlabel('曜日')
-            plt.ylabel('メール数')
-            plt.xticks(range(7), jp_weekdays, rotation=45)
-            plt.tight_layout()
-            
-            # 一時ファイルとして保存
-            output_path = 'temp_plots/weekday_distribution.png'
-            plt.savefig(output_path)
-            plt.close()
-            
-            return output_path
+            # データラベルを追加
+            for i, v in enumerate(ordered_counts):
+                ax.text(i, v + 0.1, str(v), ha='center')
             
         except Exception as e:
             print(f"曜日グラフ作成エラー: {e}")
-            return None
+            plt.title('曜日別データ (エラー発生)', fontsize=14)
+        
+        plt.tight_layout()
+        plt.savefig('temp_plots/weekday_distribution.png')
+        plt.close()
+        
+        return 'temp_plots/weekday_distribution.png'
 
     def _generate_marketing_insights(self, df, sender_email):
         """マーケティングプロの考察を生成（JST対応）"""
@@ -1789,6 +1875,268 @@ class GmailAnalyzer:
                 return pd.to_datetime(date_str, errors='coerce')
         except:
             return pd.NaT  # Not a Time を返す
+
+    def generate_insights_with_claude(self, df, sender_email):
+        """Claudeを使用してデータに基づいた考察を生成する（詳細版）"""
+        try:
+            # APIキーの取得（環境変数から、または設定ファイルから）
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+            if not api_key:
+                print("Claude APIキーが設定されていません。環境変数 ANTHROPIC_API_KEY を設定してください。")
+                return self._get_default_insights()
+            
+            # データの準備（Claudeに送信するデータを構造化）
+            data_summary = self._prepare_data_for_claude(df, sender_email)
+            
+            # Claudeクライアントの初期化
+            client = anthropic.Anthropic(api_key=api_key)
+            
+            # プロンプトの作成（より詳細な考察を求めるように改善）
+            prompt = f"""
+あなたはメール分析の専門家です。以下のGmailの送信データに基づいて、具体的で実用的な考察と改善提案を提供してください。
+データを詳細に分析し、送信者が効果的なメール戦略を立てるための具体的なアドバイスを5つ提供してください。
+各考察は簡潔かつ具体的に、実行可能な提案を含めてください。
+
+{data_summary}
+
+考察と提案を箇条書きで5つ提供してください。各項目は50-70文字程度の簡潔な内容にしてください。
+以下のフォーマットで回答してください：
+
+1. [具体的な考察]: [実行可能な提案]
+2. [具体的な考察]: [実行可能な提案]
+...
+
+回答は日本語でお願いします。
+"""
+            
+            # Claudeに送信して回答を取得
+            try:
+                message = client.messages.create(
+                    model="claude-3-haiku-20240307",
+                    max_tokens=1000,
+                    temperature=0.7,
+                    system="あなたはメール分析の専門家です。データに基づいた具体的で実用的な考察と改善提案を提供してください。",
+                    messages=[
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                
+                # 回答からインサイトを抽出
+                response = message.content[0].text
+                print("Claude API応答:", response[:100] + "...")
+                
+                # 回答を行ごとに分割して整形
+                insights = []
+                for line in response.strip().split('\n'):
+                    line = line.strip()
+                    if re.match(r'^\d+\.', line):  # 番号付きの行のみを抽出
+                        insights.append(line)
+                
+                # インサイトが取得できなかった場合はデフォルトを使用
+                if not insights:
+                    print("Claude APIからの考察を抽出できませんでした。デフォルトの考察を使用します。")
+                    return self._get_default_insights()
+                
+                return insights
+                
+            except Exception as api_error:
+                print(f"Claude API呼び出しエラー: {api_error}")
+                return self._get_default_insights()
+            
+        except Exception as e:
+            print(f"考察生成エラー: {e}")
+            return self._get_default_insights()
+
+    def _get_default_insights(self):
+        """デフォルトの考察を返す（APIが利用できない場合など）- 簡潔版"""
+        return [
+            "1. 最適送信時間の活用: 朝9時台と夕方17-18時台に送信し開封率向上",
+            "2. 曜日最適化: 火-木曜日は開封率高く、月曜は埋もれやすい傾向",
+            "3. コンテンツ調整: 朝は簡潔、昼はビジュアル、夕方は詳細情報を提供",
+            "4. セグメント配信: 「朝型」「夜型」ユーザー別に最適時間帯で配信",
+            "5. A/Bテスト実施: 異なる時間帯で送信し開封率・クリック率を比較"
+        ]
+
+    def _prepare_data_for_claude(self, df, sender_email):
+        """Claudeに送信するデータを準備する（インデックスエラー修正版）"""
+        # 基本統計情報
+        total_emails = len(df)
+        date_range = f"{df['date'].min().strftime('%Y-%m-%d')} から {df['date'].max().strftime('%Y-%m-%d')}"
+        
+        # 時間帯別の分布
+        hourly_counts = df['hour'].value_counts().sort_index()
+        peak_hour = hourly_counts.idxmax()
+        peak_hour_count = hourly_counts.max()
+        peak_hour_percentage = (peak_hour_count / total_emails) * 100
+        
+        # 曜日別の分布（エラー修正）
+        weekday_counts = df['weekday'].value_counts().sort_index()
+        weekday_names = ['月曜日', '火曜日', '水曜日', '木曜日', '金曜日', '土曜日', '日曜日']
+        
+        # エラー修正: peak_weekday_idxが文字列の場合の対応
+        peak_weekday_idx = weekday_counts.idxmax()
+        
+        # インデックスの型を確認して適切に処理
+        if isinstance(peak_weekday_idx, str):
+            # 文字列の場合は直接曜日名として使用
+            peak_weekday = peak_weekday_idx
+        elif isinstance(peak_weekday_idx, (int, np.integer)) and 0 <= peak_weekday_idx < len(weekday_names):
+            # 整数の場合はweekday_namesから取得
+            peak_weekday = weekday_names[peak_weekday_idx]
+        else:
+            # その他の場合は不明として処理
+            peak_weekday = "不明"
+        
+        peak_weekday_count = weekday_counts.max()
+        peak_weekday_percentage = (peak_weekday_count / total_emails) * 100
+        
+        # 月別の分布
+        df['month'] = df['date'].dt.month
+        monthly_counts = df['month'].value_counts().sort_index()
+        month_names = ['1月', '2月', '3月', '4月', '5月', '6月', '7月', '8月', '9月', '10月', '11月', '12月']
+        
+        # エラー修正: peak_month_idxが文字列の場合の対応
+        peak_month_idx = monthly_counts.idxmax()
+        
+        # インデックスの型を確認して適切に処理
+        if isinstance(peak_month_idx, str):
+            # 文字列の場合は直接月名として使用
+            peak_month = peak_month_idx
+        elif isinstance(peak_month_idx, (int, np.integer)) and 1 <= peak_month_idx <= 12:
+            # 整数の場合はmonth_namesから取得（1-indexedを0-indexedに調整）
+            peak_month = month_names[peak_month_idx - 1]
+        else:
+            # その他の場合は不明として処理
+            peak_month = "不明"
+        
+        peak_month_count = monthly_counts.max()
+        peak_month_percentage = (peak_month_count / total_emails) * 100
+        
+        # 時間帯×曜日のヒートマップデータ
+        try:
+            heatmap_data = df.groupby(['weekday', 'hour']).size().unstack(fill_value=0)
+            best_hour_weekday = np.unravel_index(np.argmax(heatmap_data.values), heatmap_data.shape)
+            
+            # エラー修正: インデックスの型を確認して適切に処理
+            best_weekday_idx = best_hour_weekday[0]
+            if isinstance(best_weekday_idx, (int, np.integer)) and 0 <= best_weekday_idx < len(weekday_names):
+                best_weekday = weekday_names[best_weekday_idx]
+            else:
+                best_weekday = "不明"
+            
+            best_hour = best_hour_weekday[1]
+            best_combo_count = heatmap_data.values[best_hour_weekday]
+            best_combo_percentage = (best_combo_count / total_emails) * 100
+        except Exception as e:
+            print(f"ヒートマップデータ処理エラー: {e}")
+            best_weekday = "不明"
+            best_hour = "不明"
+            best_combo_count = 0
+            best_combo_percentage = 0
+        
+        # 季節的なパターン
+        df['season'] = df['date'].dt.month.apply(lambda m: '春' if 3 <= m <= 5 else '夏' if 6 <= m <= 8 else '秋' if 9 <= m <= 11 else '冬')
+        season_counts = df['season'].value_counts()
+        peak_season = season_counts.idxmax()
+        peak_season_count = season_counts.max()
+        peak_season_percentage = (peak_season_count / total_emails) * 100
+        
+        # 連続した日のパターン
+        try:
+            df_sorted = df.sort_values('date')
+            df_sorted['prev_date'] = df_sorted['date'].shift(1)
+            df_sorted['days_since_last'] = (df_sorted['date'] - df_sorted['prev_date']).dt.days
+            avg_days_between = df_sorted['days_since_last'].mean()
+        except Exception as e:
+            print(f"送信間隔計算エラー: {e}")
+            avg_days_between = 0
+        
+        # データサマリーの作成
+        data_summary = f"""
+基本情報:
+- 送信者: {sender_email}
+- 総メール数: {total_emails}
+- 分析期間: {date_range}
+
+時間帯別分析:
+- 最も送信が多い時間帯: {peak_hour}時 ({peak_hour_count}件, 全体の{peak_hour_percentage:.1f}%)
+- 時間帯別送信数: {', '.join([f"{h}時: {c}件" for h, c in hourly_counts.items()])}
+
+曜日別分析:
+- 最も送信が多い曜日: {peak_weekday} ({peak_weekday_count}件, 全体の{peak_weekday_percentage:.1f}%)
+- 曜日別送信数: {', '.join([f"{w}: {c}件" for w, c in weekday_counts.items()])}
+
+月別・季節分析:
+- 最も送信が多い月: {peak_month} ({peak_month_count}件, 全体の{peak_month_percentage:.1f}%)
+- 最も送信が多い季節: {peak_season} ({peak_season_count}件, 全体の{peak_season_percentage:.1f}%)
+
+最適な組み合わせ:
+- 最も送信が多い時間帯×曜日の組み合わせ: {best_weekday}の{best_hour}時 ({best_combo_count}件, 全体の{best_combo_percentage:.1f}%)
+
+送信頻度:
+- 平均送信間隔: {avg_days_between:.1f}日
+"""
+        
+        return data_summary
+
+    def _create_monthly_distribution_plot(self, df, figsize=(10, 6)):
+        """月別分布グラフを作成"""
+        try:
+            # 日付データの準備
+            df['month'] = pd.to_datetime(df['date']).dt.month
+            
+            # 月別カウント
+            monthly_counts = df['month'].value_counts().sort_index()
+            
+            # 1-12月すべてを表示するための準備
+            full_months = pd.Series(0, index=range(1, 13))
+            for month, count in monthly_counts.items():
+                full_months[month] = count
+            
+            # 月名のマッピング
+            month_names = ['1月', '2月', '3月', '4月', '5月', '6月', 
+                           '7月', '8月', '9月', '10月', '11月', '12月']
+            
+            # プロット
+            plt.figure(figsize=figsize)
+            bars = plt.bar(range(1, 13), full_months.values, color='#9b59b6')
+            
+            # 軸とタイトルの設定
+            plt.title('月別メール数', pad=10)
+            plt.xlabel('月')
+            plt.ylabel('メール数')
+            
+            # x軸のラベルを設定
+            plt.xticks(range(1, 13), month_names, rotation=45)
+            
+            # グリッド線の追加
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
+            
+            # y軸を0から開始
+            plt.ylim(bottom=0)
+            
+            # データがあるバーにラベルを表示
+            for bar in bars:
+                height = bar.get_height()
+                if height > 0:
+                    plt.text(bar.get_x() + bar.get_width()/2., height + 0.5,
+                            f'{int(height)}', ha='center', va='bottom')
+            
+            plt.tight_layout()
+            
+            # 一時ファイルとして保存
+            os.makedirs('temp_plots', exist_ok=True)
+            output_path = 'temp_plots/monthly_distribution.png'
+            plt.savefig(output_path)
+            plt.close()
+            
+            return output_path
+            
+        except Exception as e:
+            print(f"月別グラフ作成エラー: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
 def get_message_content(service, user_id, msg_id):
     """メッセージの本文を取得する"""
